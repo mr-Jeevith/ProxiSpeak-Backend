@@ -1,0 +1,50 @@
+
+<
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ProxiSpeak Avatar Test</title>
+</head>
+<body>
+    <h2>ProxiSpeak Avatar Movement Test</h2>
+    <p id="status">Connecting...</p>
+
+    <label>X:</label>
+    <input id="x" type="number" value="100">
+
+    <label>Y:</label>
+    <input id="y" type="number" value="150">
+
+    <button onclick="sendPosition()">Send Position</button>
+
+    <h3>Received avatar updates</h3>
+    <pre id="updates">No updates yet</pre>
+
+    <script src="http://localhost:3000/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io("http://localhost:3000");
+
+        socket.on("connect", () => {
+            document.getElementById("status").textContent =
+                "Connected: " + socket.id;
+        });
+
+        socket.on("connect_error", (error) => {
+            document.getElementById("status").textContent =
+                "Connection failed: " + error.message;
+        });
+
+        function sendPosition() {
+            const x = Number(document.getElementById("x").value);
+            const y = Number(document.getElementById("y").value);
+
+            socket.emit("avatar-move", { x, y });
+        }
+
+        socket.on("avatar-update", (data) => {
+            document.getElementById("updates").textContent =
+                JSON.stringify(data, null, 2);
+        });
+    </script>
+</body>
+</html>
