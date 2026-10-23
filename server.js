@@ -1,4 +1,5 @@
 
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -8,12 +9,14 @@ const server = http.createServer(app);
 
 const PORT = 4000;
 
+const ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+];
+
 const io = new Server(server, {
     cors: {
-        origin: [
-            "http://localhost:5173",
-            "http://127.0.0.1:5173"
-        ],
+        origin: ALLOWED_ORIGINS,
         methods: ["GET", "POST"]
     }
 });
@@ -23,6 +26,10 @@ const rooms = new Map();
 
 // socket.id -> roomId
 const socketRooms = new Map();
+
+// --------------------------------------------------
+// HTTP ENDPOINTS
+// --------------------------------------------------
 
 app.get("/", (req, res) => {
     res.send("ProxiSpeak Backend is Running!");
@@ -36,7 +43,18 @@ app.get("/health", (req, res) => {
     });
 });
 
-// Validate coordinates
+// --------------------------------------------------
+// VALIDATION HELPERS
+// --------------------------------------------------
+
+function validRoomId(roomId) {
+    return (
+        typeof roomId === "string" &&
+        roomId.trim().length > 0 &&
+        roomId.length <= 50
+    );
+}
+
 function validPosition(x, y) {
     return (
         Number.isFinite(x) &&
@@ -48,7 +66,62 @@ function validPosition(x, y) {
     );
 }
 
-// Send every player the positions of other players in their room
+function validDescription(description, expectedType) {
+    return (
+        description !== null &&
+        typeof description === "object" &&
+        description.type === expectedType &&
+        typeof description.sdp === "string" &&
+        description.sdp.length > 0 &&
+        description.sdp.length <= 100000
+    );
+}
+
+function validIceCandidate(candidate) {
+    if (
+        candidate === null ||
+        typeof candidate !== "object" ||
+        Array.isArray(candidate)
+    ) {
+        return false;
+    }
+
+    if (
+        typeof candidate.candidate !== "string" ||
+        candidate.candidate.length > 4096
+    ) {
+        return false;
+    }
+
+    if (
+        candidate.sdpMid != null &&
+        typeof candidate.sdpMid !== "string"
+    ) {
+        return false;
+    }
+
+    if (
+        candidate.sdpMLineIndex != null &&
+        (!Number.isInteger(candidate.sdpMLineIndex) ||
+            candidate.sdpMLineIndex < 0)
+    ) {
+        return false;
+    }
+
+    if (
+        candidate.usernameFragment != null &&
+        typeof candidate.usernameFragment !== "string"
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+// --------------------------------------------------
+// PLAYER BROADCASTING
+// --------------------------------------------------
+
 function broadcastPlayers(roomId) {
     const room = rooms.get(roomId);
 
@@ -61,13 +134,16 @@ function broadcastPlayers(roomId) {
 
         const otherPlayers = [...room.entries()]
             .filter(([otherSocketId]) => otherSocketId !== socketId)
-            .map(([, player]) => player);
+            .map(([, player]) => ({ ...player }));
 
         socket.emit("players:update", otherPlayers);
     }
 }
 
-// Remove a client from its current room
+// --------------------------------------------------
+// ROOM CLEANUP
+// --------------------------------------------------
+
 function leaveRoom(socket) {
     const roomId = socketRooms.get(socket.id);
 
@@ -75,9 +151,15 @@ function leaveRoom(socket) {
 
     const room = rooms.get(roomId);
 
-    room?.delete(socket.id);
+    if (room) {
+        room.delete(socket.id);
+    }
+
     socketRooms.delete(socket.id);
     socket.leave(roomId);
+
+    // Clear stale remote-player state for the leaving client.
+    socket.emit("players:update", []);
 
     console.log(`Client ${socket.id} left room ${roomId}`);
 
@@ -88,28 +170,84 @@ function leaveRoom(socket) {
     }
 }
 
+// --------------------------------------------------
+// WEBRTC SIGNALING
+// --------------------------------------------------
+
+function relayWebRTC(socket, eventName, data, payload) {
+    const roomId = socketRooms.get(socket.id);
+
+    // Sender must have joined the room.
+    if (!roomId || data?.roomId !== roomId) {
+        console.log("Rejected signaling: room mismatch", socket.id);
+        return;
+    }
+
+    const targetId = data?.to;
+
+    if (
+        typeof targetId !== "string" ||
+        targetId.length === 0 ||
+        targetId === socket.id
+    ) {
+        console.log("Rejected signaling: invalid target", socket.id);
+        return;
+    }
+
+    // Verify the recipient belongs to the sender's room.
+    const room = rooms.get(roomId);
+
+    if (!room || !room.has(targetId)) {
+        console.log("Rejected signaling: target not in room", targetId);
+        return;
+    }
+
+    const targetSocket = io.sockets.sockets.get(targetId);
+
+    if (!targetSocket || socketRooms.get(targetId) !== roomId) {
+        console.log("Rejected signaling: target disconnected", targetId);
+        return;
+    }
+
+    targetSocket.emit(eventName, {
+        from: socket.id,
+        roomId,
+        ...payload
+    });
+
+    console.log(
+        `Relayed ${eventName} from ${socket.id} to ${targetId} in ${roomId}`
+    );
+}
+
+// --------------------------------------------------
+// SOCKET.IO EVENTS
+// --------------------------------------------------
+
 io.on("connection", (socket) => {
     console.log("Client connected:", socket.id);
 
-    // Join a room and register the player's initial position
+    // ----------------------------------------------
+    // JOIN ROOM
+    // ----------------------------------------------
+
     socket.on("player:join", (data) => {
         const roomId = data?.roomId;
         const player = data?.player;
 
         if (
-            typeof roomId !== "string" ||
-            roomId.trim().length === 0 ||
-            roomId.length > 50 ||
+            !validRoomId(roomId) ||
             !player ||
             typeof player.id !== "string" ||
-            player.id.length === 0 ||
+            player.id.trim().length === 0 ||
+            player.id.length > 100 ||
             !validPosition(player.x, player.y)
         ) {
             console.log("Invalid player:join payload from", socket.id);
             return;
         }
 
-        // A socket can belong to only one room at a time
+        // Avoid stale membership when switching rooms.
         leaveRoom(socket);
 
         if (!rooms.has(roomId)) {
@@ -136,13 +274,17 @@ io.on("connection", (socket) => {
         socket.join(roomId);
 
         console.log(
-            `${safePlayer.name} joined room ${roomId} at (${safePlayer.x}, ${safePlayer.y})`
+            `${safePlayer.name} joined room ${roomId} ` +
+            `at (${safePlayer.x}, ${safePlayer.y})`
         );
 
         broadcastPlayers(roomId);
     });
 
-    // Update a player's position
+    // ----------------------------------------------
+    // PLAYER MOVEMENT
+    // ----------------------------------------------
+
     socket.on("player:move", (data) => {
         const roomId = socketRooms.get(socket.id);
 
@@ -163,19 +305,69 @@ io.on("connection", (socket) => {
         player.x = data.x;
         player.y = data.y;
 
-        console.log(
-            `Player ${player.id} moved in ${roomId}: (${player.x}, ${player.y})`
-        );
-
         broadcastPlayers(roomId);
     });
 
-    // Explicit room leave, if the frontend uses it
+    // ----------------------------------------------
+    // LEAVE ROOM
+    // ----------------------------------------------
+
     socket.on("player:leave", () => {
         leaveRoom(socket);
     });
 
-    // Clean up disconnected clients
+    // ----------------------------------------------
+    // WEBRTC OFFER
+    // Payload: { roomId, to, description }
+    // ----------------------------------------------
+
+    socket.on("rtc:offer", (data) => {
+        if (!validDescription(data?.description, "offer")) {
+            console.log("Invalid WebRTC offer from", socket.id);
+            return;
+        }
+
+        relayWebRTC(socket, "rtc:offer", data, {
+            description: data.description
+        });
+    });
+
+    // ----------------------------------------------
+    // WEBRTC ANSWER
+    // Payload: { roomId, to, description }
+    // ----------------------------------------------
+
+    socket.on("rtc:answer", (data) => {
+        if (!validDescription(data?.description, "answer")) {
+            console.log("Invalid WebRTC answer from", socket.id);
+            return;
+        }
+
+        relayWebRTC(socket, "rtc:answer", data, {
+            description: data.description
+        });
+    });
+
+    // ----------------------------------------------
+    // ICE CANDIDATE
+    // Payload: { roomId, to, candidate }
+    // ----------------------------------------------
+
+    socket.on("rtc:ice-candidate", (data) => {
+        if (!validIceCandidate(data?.candidate)) {
+            console.log("Invalid ICE candidate from", socket.id);
+            return;
+        }
+
+        relayWebRTC(socket, "rtc:ice-candidate", data, {
+            candidate: data.candidate
+        });
+    });
+
+    // ----------------------------------------------
+    // DISCONNECT
+    // ----------------------------------------------
+
     socket.on("disconnect", (reason) => {
         leaveRoom(socket);
 
@@ -185,7 +377,10 @@ io.on("connection", (socket) => {
     });
 });
 
-// Start the HTTP and Socket.IO server
+// --------------------------------------------------
+// START SERVER
+// --------------------------------------------------
+
 server.listen(PORT, () => {
     console.log(`ProxiSpeak backend running on port ${PORT}`);
 });
